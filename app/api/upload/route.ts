@@ -1,13 +1,7 @@
 export const runtime = "nodejs";
 
-function getBackendConfig() {
-  const baseUrl = process.env.BACKEND_BASE_URL;
-  const apiKey = process.env.BACKEND_API_KEY;
-  if (!baseUrl || !apiKey) {
-    throw new Error("BACKEND_BASE_URL and BACKEND_API_KEY must be configured.");
-  }
-  return { baseUrl: baseUrl.replace(/\/$/, ""), apiKey };
-}
+import { getBackendConfig } from "../_backend";
+import { logBackendConfig } from "../_backend";
 
 export async function POST(request: Request) {
   try {
@@ -21,6 +15,7 @@ export async function POST(request: Request) {
     payload.append("file", file, file.name);
 
     const { baseUrl, apiKey } = getBackendConfig();
+    logBackendConfig("api/upload", { baseUrl, apiKey });
     const response = await fetch(`${baseUrl}/upload`, {
       method: "POST",
       headers: {

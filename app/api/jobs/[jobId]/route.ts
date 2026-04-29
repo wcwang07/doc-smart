@@ -1,18 +1,13 @@
 export const runtime = "nodejs";
 
-function getBackendConfig() {
-  const baseUrl = process.env.BACKEND_BASE_URL;
-  const apiKey = process.env.BACKEND_API_KEY;
-  if (!baseUrl || !apiKey) {
-    throw new Error("BACKEND_BASE_URL and BACKEND_API_KEY must be configured.");
-  }
-  return { baseUrl: baseUrl.replace(/\/$/, ""), apiKey };
-}
+import { getBackendConfig } from "../../_backend";
+import { logBackendConfig } from "../../_backend";
 
 export async function GET(_: Request, context: { params: Promise<{ jobId: string }> }) {
   try {
     const { jobId } = await context.params;
     const { baseUrl, apiKey } = getBackendConfig();
+    logBackendConfig("api/jobs/[jobId]", { baseUrl, apiKey });
 
     const response = await fetch(`${baseUrl}/jobs/${jobId}`, {
       headers: {
