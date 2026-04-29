@@ -125,9 +125,10 @@ export function ChatDemo() {
         })
       });
 
-      const data = (await response.json()) as { response?: string; detail?: string };
-      if (!response.ok || !data.response) {
-        throw new Error(data.detail || "Conversation request failed.");
+      const data = (await response.json()) as { response?: string } | ErrorPayload;
+      if (!response.ok || !("response" in data) || !data.response) {
+        const errorPayload = data as ErrorPayload;
+        throw new Error(errorPayload.detail || "Conversation request failed.");
       }
 
       setMessages((current) => [...current, { role: "assistant", content: data.response! }]);
