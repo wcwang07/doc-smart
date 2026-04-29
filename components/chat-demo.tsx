@@ -20,6 +20,10 @@ type JobStatus = {
   error?: string | null;
 };
 
+type ErrorPayload = {
+  detail?: string;
+};
+
 export function ChatDemo() {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -60,9 +64,10 @@ export function ChatDemo() {
         body: payload
       });
 
-      const data = (await response.json()) as JobResponse | { detail?: string };
+      const data = (await response.json()) as JobResponse | ErrorPayload;
       if (!response.ok || !("job_id" in data)) {
-        throw new Error(data.detail || "Upload failed.");
+        const errorPayload = data as ErrorPayload;
+        throw new Error(errorPayload.detail || "Upload failed.");
       }
 
       const jobId = data.job_id;
@@ -77,9 +82,10 @@ export function ChatDemo() {
   async function pollJob(jobId: string) {
     for (;;) {
       const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
-      const data = (await response.json()) as JobStatus | { detail?: string };
+      const data = (await response.json()) as JobStatus | ErrorPayload;
       if (!response.ok || !("status" in data)) {
-        throw new Error(data.detail || "Job polling failed.");
+        const errorPayload = data as ErrorPayload;
+        throw new Error(errorPayload.detail || "Job polling failed.");
       }
 
       setJobState(data);
