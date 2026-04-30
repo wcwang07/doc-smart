@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, type FormEvent, useMemo, useState } from "react";
+import { type CSSProperties, type FormEvent, useEffect, useMemo, useState } from "react";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -11,12 +11,14 @@ type JobResponse = {
   job_id: string;
   status: string;
   message: string;
+  file_id?: string;
 };
 
 type JobStatus = {
   job_id: string;
   status: string;
   message: string;
+  file_id?: string;
   error?: string | null;
 };
 
@@ -24,10 +26,55 @@ type ErrorPayload = {
   detail?: string;
 };
 
+type DocumentItem = {
+  file_id: string;
+  filename?: string;
+  status?: string;
+  created_at?: string;
+};
+
+function readString(value: unknown) {
+  return typeof value === "string" ? value : undefined;
+}
+
+function normalizeDocument(raw: unknown): DocumentItem | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const record = raw as Record<string, unknown>;
+  const fileId = readString(record.file_id) || readString(record.fileId) || readString(record.id);
+  if (!fileId) {
+    return null;
+  }
+
+  return {
+    file_id: fileId,
+    filename: readString(record.filename) || readString(record.name) || readString(record.title),
+    status: readString(record.status),
+    created_at: readString(record.created_at) || readString(record.createdAt)
+  };
+}
+
+function normalizeDocuments(raw: unknown) {
+  const source =
+    Array.isArray(raw)
+      ? raw
+      : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).documents)
+        ? ((raw as Record<string, unknown>).documents as unknown[])
+        : raw && typeof raw === "object" && Array.isArray((raw as Record<string, unknown>).files)
+          ? ((raw as Record<string, unknown>).files as unknown[])
+          : [];
+
+  return source.map(normalizeDocument).filter((document): document is DocumentItem => Boolean(document));
+}
+
 export function ChatDemo() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [fileId, setFileId] = useState<string | null>(null);
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [loadingDocuments, setLoadingDocuments] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -38,6 +85,44 @@ export function ChatDemo() {
   const showProcessingToast =
     uploading && Boolean(activeJobId) && jobState?.status !== "completed" && jobState?.status !== "failed";
   const processingMessage = jobState?.message || "Processing upload and polling job status...";
+  const selectedDocument = useMemo(
+    () => documents.find((document) => document.file_id === fileId),
+    [documents, fileId]
+  );
+
+  useEffect(() => {
+    void loadDocuments();
+  }, []);
+
+  async function loadDocuments(preferredFileId?: string) {
+    setLoadingDocuments(true);
+    try {
+      const response = await fetch("/api/documents", { cache: "no-store" });
+      const data = (await response.json()) as unknown;
+      if (!response.ok) {
+        const errorPayload = data as ErrorPayload;
+        throw new Error(errorPayload.detail || "Document list failed.");
+      }
+
+      const nextDocuments = normalizeDocuments(data);
+      setDocuments(nextDocuments);
+      const nextFileId =
+        preferredFileId && nextDocuments.some((document) => document.file_id === preferredFileId)
+          ? preferredFileId
+          : fileId && nextDocuments.some((document) => document.file_id === fileId)
+            ? fileId
+            : nextDocuments.find((document) => document.status?.toLowerCase() === "completed")?.file_id ||
+              nextDocuments[0]?.file_id;
+
+      if (nextFileId) {
+        setFileId(nextFileId);
+      }
+    } catch (documentsError) {
+      console.error("[ui] documents failed", documentsError);
+    } finally {
+      setLoadingDocuments(false);
+    }
+  }
 
   async function onUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -113,9 +198,11 @@ export function ChatDemo() {
 
       setJobState(data);
       if (data.status === "completed") {
-        console.log("[ui] polling completed", { jobId });
-        setFileId(jobId);
+        const indexedFileId = data.file_id || jobId;
+        console.log("[ui] polling completed", { jobId, fileId: indexedFileId });
+        setFileId(indexedFileId);
         setActiveJobId(null);
+        await loadDocuments(indexedFileId);
         return;
       }
       if (data.status === "failed") {
@@ -142,6 +229,13 @@ export function ChatDemo() {
       });
       return;
     }
+    if (!fileId) {
+      console.warn("[ui] ask blocked", {
+        hasFileId: false
+      });
+      setError("Select an indexed document before asking a question.");
+      return;
+    }
 
     const nextMessages = [...messages, { role: "user" as const, content: question.trim() }];
     console.log("[ui] ask payload prepared", {
@@ -159,9 +253,10 @@ export function ChatDemo() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          system_prompt: "You are a concise assistant.",
-          top_k: 5,
-          ...(fileId ? { file_id: fileId } : {}),
+          system_prompt:
+            "You are a concise assistant. Answer only from the selected document context. If the answer is not in the context, say you do not know.",
+          top_k: 12,
+          file_id: fileId,
           messages: nextMessages
         })
       });
@@ -226,7 +321,30 @@ export function ChatDemo() {
               ? `Status: ${jobState.status} — ${jobState.message}`
               : "Supported file types match the backend: .pdf and .txt"}
           </p>
-          {fileId ? <p style={styles.success}>Indexed file ID: {fileId}</p> : null}
+          <label style={styles.selectLabel} htmlFor="document-select">
+            Ask about
+          </label>
+          <select
+            id="document-select"
+            value={fileId || ""}
+            onChange={(event) => {
+              setFileId(event.target.value || null);
+              setMessages([]);
+            }}
+            style={styles.select}
+          >
+            <option value="">{loadingDocuments ? "Loading documents..." : "Select a document"}</option>
+            {documents.map((document) => (
+              <option key={document.file_id} value={document.file_id}>
+                {document.filename || document.file_id}
+              </option>
+            ))}
+          </select>
+          {fileId ? (
+            <p style={styles.success}>
+              Selected document: {selectedDocument?.filename || fileId}
+            </p>
+          ) : null}
         </div>
 
         <div style={styles.panelTall}>
@@ -404,6 +522,23 @@ const styles: Record<string, CSSProperties> = {
     color: "var(--muted)",
     lineHeight: 1.5,
     margin: "18px 0 0"
+  },
+  selectLabel: {
+    display: "block",
+    margin: "18px 0 8px",
+    fontSize: "0.85rem",
+    fontWeight: 700,
+    color: "var(--muted)",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em"
+  },
+  select: {
+    width: "100%",
+    padding: "12px",
+    borderRadius: "12px",
+    border: "1px solid var(--line)",
+    background: "#fff",
+    color: "inherit"
   },
   success: {
     margin: "12px 0 0",
