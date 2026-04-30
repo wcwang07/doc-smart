@@ -25,26 +25,31 @@ type ErrorPayload = {
 };
 
 export function ChatDemo() {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content: "Upload a PDF first, then ask a question about its contents."
-    }
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [fileId, setFileId] = useState<string | null>(null);
+  const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canAsk = useMemo(() => !!fileId && !asking && question.trim().length > 0, [asking, fileId, question]);
+  const canAsk = useMemo(() => !asking && question.trim().length > 0, [asking, question]);
+  const showProcessingToast =
+    uploading && Boolean(activeJobId) && jobState?.status !== "completed" && jobState?.status !== "failed";
+  const processingMessage = jobState?.message || "Processing upload and polling job status...";
 
   async function onUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
     const fileInput = form.elements.namedItem("file") as HTMLInputElement | null;
     const file = fileInput?.files?.[0];
+    console.log("[ui] upload submit", {
+      hasFile: Boolean(file),
+      fileName: file?.name,
+      fileSize: file?.size,
+      fileType: file?.type
+    });
     if (!file) {
       setError("Choose a PDF or text file first.");
       return;
@@ -53,6 +58,7 @@ export function ChatDemo() {
     setUploading(true);
     setError(null);
     setFileId(null);
+    setActiveJobId(null);
     setJobState(null);
 
     try {
@@ -63,26 +69,43 @@ export function ChatDemo() {
         method: "POST",
         body: payload
       });
+      console.log("[ui] upload response received", {
+        ok: response.ok,
+        status: response.status
+      });
 
       const data = (await response.json()) as JobResponse | ErrorPayload;
+      console.log("[ui] upload response body", data);
       if (!response.ok || !("job_id" in data)) {
         const errorPayload = data as ErrorPayload;
         throw new Error(errorPayload.detail || "Upload failed.");
       }
 
       const jobId = data.job_id;
+      setActiveJobId(jobId);
+      console.log("[ui] upload accepted", { jobId });
       await pollJob(jobId);
     } catch (uploadError) {
+      console.error("[ui] upload failed", uploadError);
+      setActiveJobId(null);
       setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
     } finally {
+      console.log("[ui] upload finished");
       setUploading(false);
     }
   }
 
   async function pollJob(jobId: string) {
+    console.log("[ui] polling started", { jobId });
     for (;;) {
       const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
+      console.log("[ui] polling response received", {
+        jobId,
+        ok: response.ok,
+        status: response.status
+      });
       const data = (await response.json()) as JobStatus | ErrorPayload;
+      console.log("[ui] polling response body", { jobId, data });
       if (!response.ok || !("status" in data)) {
         const errorPayload = data as ErrorPayload;
         throw new Error(errorPayload.detail || "Job polling failed.");
@@ -90,24 +113,42 @@ export function ChatDemo() {
 
       setJobState(data);
       if (data.status === "completed") {
+        console.log("[ui] polling completed", { jobId });
         setFileId(jobId);
+        setActiveJobId(null);
         return;
       }
       if (data.status === "failed") {
+        console.error("[ui] polling failed", { jobId, data });
+        setActiveJobId(null);
         throw new Error(data.error || data.message || "Indexing failed.");
       }
 
+      console.log("[ui] polling retry scheduled", { jobId, nextPollMs: 2000 });
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
 
   async function onAsk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!fileId || !question.trim()) {
+    console.log("[ui] ask submit", {
+      fileId,
+      question,
+      canAsk
+    });
+    if (!question.trim()) {
+      console.warn("[ui] ask blocked", {
+        hasQuestion: Boolean(question.trim())
+      });
       return;
     }
 
     const nextMessages = [...messages, { role: "user" as const, content: question.trim() }];
+    console.log("[ui] ask payload prepared", {
+      fileId,
+      messageCount: nextMessages.length,
+      question: question.trim()
+    });
     setMessages(nextMessages);
     setQuestion("");
     setAsking(true);
@@ -120,34 +161,54 @@ export function ChatDemo() {
         body: JSON.stringify({
           system_prompt: "You are a concise assistant.",
           top_k: 5,
-          file_id: fileId,
+          ...(fileId ? { file_id: fileId } : {}),
           messages: nextMessages
         })
       });
+      console.log("[ui] ask response received", {
+        ok: response.ok,
+        status: response.status
+      });
 
       const data = (await response.json()) as { response?: string } | ErrorPayload;
+      console.log("[ui] ask response body", data);
       if (!response.ok || !("response" in data) || !data.response) {
         const errorPayload = data as ErrorPayload;
         throw new Error(errorPayload.detail || "Conversation request failed.");
       }
 
+      console.log("[ui] ask completed", {
+        responseLength: data.response.length
+      });
       setMessages((current) => [...current, { role: "assistant", content: data.response! }]);
     } catch (askError) {
+      console.error("[ui] ask failed", askError);
       setError(askError instanceof Error ? askError.message : "Conversation request failed.");
       setMessages((current) => current.slice(0, -1));
     } finally {
+      console.log("[ui] ask finished");
       setAsking(false);
     }
   }
 
   return (
     <main style={styles.page}>
+      {showProcessingToast ? (
+        <div style={styles.toast} role="status" aria-live="polite">
+          <div style={styles.toastDot} />
+          <div>
+            <p style={styles.toastTitle}>Processing document</p>
+            <p style={styles.toastText}>Polling `/jobs/{activeJobId}` until the job is completed.</p>
+            <p style={styles.toastMeta}>{processingMessage}</p>
+          </div>
+        </div>
+      ) : null}
+
       <section style={styles.hero}>
         <p style={styles.kicker}>DocSmartAnswer</p>
-        <h3 style={styles.title}>Chat with Your PDFs</h3>
+        <h3 style={styles.title}>Instant Document Intelligence</h3>
         <p style={styles.subtitle}>
-          Uploads and chat requests go through server-side proxy routes before reaching
-          the RAG backend.
+          Smart upload for better document understanding.
         </p>
       </section>
 
@@ -171,6 +232,12 @@ export function ChatDemo() {
         <div style={styles.panelTall}>
           <h2 style={styles.heading}>2. Ask the chatbot</h2>
           <div style={styles.messages}>
+            {messages.length === 0 ? (
+              <article style={styles.assistantBubble}>
+                <strong style={styles.messageLabel}>Assistant</strong>
+                <p style={styles.messageText}>Upload a PDF first, then ask a question about its contents.</p>
+              </article>
+            ) : null}
             {messages.map((message, index) => (
               <article
                 key={`${message.role}-${index}`}
@@ -208,6 +275,44 @@ const styles: Record<string, CSSProperties> = {
     margin: "0 auto",
     padding: "48px 20px 80px"
   },
+  toast: {
+    position: "sticky",
+    top: "18px",
+    zIndex: 20,
+    display: "flex",
+    gap: "12px",
+    alignItems: "flex-start",
+    margin: "0 0 20px",
+    padding: "14px 16px",
+    borderRadius: "18px",
+    background: "#183a2d",
+    color: "#f7fbf8",
+    boxShadow: "0 18px 40px rgba(12, 33, 25, 0.18)"
+  },
+  toastDot: {
+    width: "10px",
+    height: "10px",
+    borderRadius: "999px",
+    marginTop: "6px",
+    background: "#9ff0be",
+    boxShadow: "0 0 0 6px rgba(159, 240, 190, 0.18)"
+  },
+  toastTitle: {
+    margin: "0 0 2px",
+    fontSize: "0.95rem",
+    fontWeight: 700
+  },
+  toastText: {
+    margin: "0 0 2px",
+    fontSize: "0.9rem",
+    lineHeight: 1.45
+  },
+  toastMeta: {
+    margin: 0,
+    fontSize: "0.84rem",
+    lineHeight: 1.45,
+    color: "rgba(247, 251, 248, 0.8)"
+  },
   hero: {
     marginBottom: "28px"
   },
@@ -221,9 +326,11 @@ const styles: Record<string, CSSProperties> = {
   },
   title: {
     margin: 0,
-    maxWidth: "920px",
-    fontSize: "clamp(2.2rem, 5vw, 4.7rem)",
-    lineHeight: 1.02
+    maxWidth: "100%",
+    fontSize: "clamp(2rem, 5.2vw, 3.9rem)",
+    lineHeight: 1,
+    letterSpacing: "-0.04em",
+    whiteSpace: "nowrap"
   },
   subtitle: {
     margin: "18px 0 0",
