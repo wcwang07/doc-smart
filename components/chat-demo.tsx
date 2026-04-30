@@ -265,6 +265,20 @@ export function ChatDemo() {
           {error ? <p style={styles.error}>{error}</p> : null}
         </div>
       </section>
+
+      <footer style={styles.footer}>
+        <p style={styles.footerText}>
+          Built by{" "}
+          <a
+            href="https://www.linkedin.com/in/weicwang/"
+            target="_blank"
+            rel="noreferrer"
+            style={styles.footerLink}
+          >
+            Wei C. Wang
+          </a>
+        </p>
+      </footer>
     </main>
   );
 }
@@ -343,6 +357,21 @@ const styles: Record<string, CSSProperties> = {
     display: "grid",
     gap: "22px",
     gridTemplateColumns: "minmax(280px, 360px) minmax(0, 1fr)"
+  },
+  footer: {
+    marginTop: "28px",
+    paddingTop: "18px",
+    borderTop: "1px solid rgba(44, 36, 30, 0.12)"
+  },
+  footerText: {
+    margin: 0,
+    color: "var(--muted)",
+    fontSize: "0.95rem"
+  },
+  footerLink: {
+    color: "var(--accent-2)",
+    fontWeight: 700,
+    textDecoration: "none"
   },
   panel: {
     background: "var(--panel)",
