@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, type FormEvent, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -12,6 +12,9 @@ type JobResponse = {
   status: string;
   message: string;
   file_id?: string;
+  filename?: string;
+  processed_chunks?: number;
+  total_chunks?: number;
 };
 
 type JobStatus = {
@@ -19,22 +22,103 @@ type JobStatus = {
   status: string;
   message: string;
   file_id?: string;
+  filename?: string;
+  processed_chunks?: number;
+  total_chunks?: number;
   error?: string | null;
+};
+
+type PresignResponse = {
+  job_id: string;
+  upload_url: string;
+  upload_headers?: Record<string, string>;
 };
 
 type ErrorPayload = {
   detail?: string;
 };
 
+type UploadConfig = {
+  baseUrl: string;
+  apiKey: string;
+};
+
 type DocumentItem = {
   file_id: string;
+  job_id?: string;
   filename?: string;
   status?: string;
+  message?: string;
+  processed_chunks?: number;
+  total_chunks?: number;
   created_at?: string;
 };
 
+const trackedJobsStorageKey = "doc-smart:indexing-jobs";
+const incompleteStatuses = new Set(["pending_upload", "queued", "processing"]);
+
 function readString(value: unknown) {
   return typeof value === "string" ? value : undefined;
+}
+
+function readNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function isCompletedStatus(status?: string) {
+  return status?.toLowerCase() === "completed";
+}
+
+function isFailedStatus(status?: string) {
+  return status?.toLowerCase() === "failed";
+}
+
+function isDocumentReady(document?: DocumentItem | null) {
+  return Boolean(document && (isCompletedStatus(document.status) || (!document.status && !document.job_id)));
+}
+
+function shouldPollStatus(status?: string) {
+  return !status || incompleteStatuses.has(status.toLowerCase());
+}
+
+function formatJobProgress(item?: Pick<DocumentItem, "processed_chunks" | "total_chunks" | "status" | "message"> | null) {
+  if (!item) {
+    return "Select an indexed document before asking.";
+  }
+
+  const processed = item.processed_chunks;
+  const total = item.total_chunks;
+  if (typeof processed === "number" && typeof total === "number" && total > 0) {
+    return `Indexing ${processed} of ${total} chunks`;
+  }
+
+  if (isCompletedStatus(item.status)) {
+    return "Ready for chat.";
+  }
+  if (isFailedStatus(item.status)) {
+    return item.message || "Indexing failed.";
+  }
+
+  return item.message || "Uploaded. Indexing in background.";
+}
+
+function formatUploadError(error: unknown, config?: UploadConfig, stage?: string) {
+  const stageLabel = stage ? `${stage} failed. ` : "";
+  if (error instanceof TypeError && error.message === "Failed to fetch" && config) {
+    return `${stageLabel}Could not complete the direct upload from the browser. Check that the backend and S3 upload URL are reachable from this browser, and CORS allows this origin plus required headers. Backend: ${config.baseUrl}.`;
+  }
+
+  return error instanceof Error ? `${stageLabel}${error.message}` : `${stageLabel}Upload failed.`;
+}
+
+async function readJsonResponse<T>(response: Response, fallbackMessage: string) {
+  const data = (await response.json()) as T | ErrorPayload;
+  if (!response.ok) {
+    const errorPayload = data as ErrorPayload;
+    throw new Error(errorPayload.detail || fallbackMessage);
+  }
+
+  return data as T;
 }
 
 function normalizeDocument(raw: unknown): DocumentItem | null {
@@ -44,14 +128,19 @@ function normalizeDocument(raw: unknown): DocumentItem | null {
 
   const record = raw as Record<string, unknown>;
   const fileId = readString(record.file_id) || readString(record.fileId) || readString(record.id);
+  const jobId = readString(record.job_id) || readString(record.jobId);
   if (!fileId) {
     return null;
   }
 
   return {
     file_id: fileId,
+    job_id: jobId,
     filename: readString(record.filename) || readString(record.name) || readString(record.title),
     status: readString(record.status),
+    message: readString(record.message),
+    processed_chunks: readNumber(record.processed_chunks) ?? readNumber(record.processedChunks),
+    total_chunks: readNumber(record.total_chunks) ?? readNumber(record.totalChunks),
     created_at: readString(record.created_at) || readString(record.createdAt)
   };
 }
@@ -69,30 +158,169 @@ function normalizeDocuments(raw: unknown) {
   return source.map(normalizeDocument).filter((document): document is DocumentItem => Boolean(document));
 }
 
+function jobToDocument(job: JobStatus): DocumentItem {
+  const fileId = job.file_id || job.job_id;
+  return {
+    file_id: fileId,
+    job_id: job.job_id,
+    filename: job.filename,
+    status: job.status,
+    message: job.message,
+    processed_chunks: job.processed_chunks,
+    total_chunks: job.total_chunks
+  };
+}
+
+function readTrackedJobs() {
+  if (typeof window === "undefined") {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(trackedJobsStorageKey) || "{}") as Record<string, JobStatus>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeTrackedJobs(jobs: Record<string, JobStatus>) {
+  window.localStorage.setItem(trackedJobsStorageKey, JSON.stringify(jobs));
+}
+
 export function ChatDemo() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
   const [fileId, setFileId] = useState<string | null>(null);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
+  const [trackedJobs, setTrackedJobs] = useState<Record<string, JobStatus>>({});
   const [loadingDocuments, setLoadingDocuments] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
+  const [uploadConfig, setUploadConfig] = useState<UploadConfig | null>(null);
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const canAsk = useMemo(() => !asking && question.trim().length > 0, [asking, question]);
-  const showProcessingToast =
-    uploading && Boolean(activeJobId) && jobState?.status !== "completed" && jobState?.status !== "failed";
-  const processingMessage = jobState?.message || "Processing upload and polling job status...";
+  const displayedDocuments = useMemo(() => {
+    const merged = new Map<string, DocumentItem>();
+    documents.forEach((document) => {
+      merged.set(document.file_id, document);
+    });
+    Object.values(trackedJobs).forEach((job) => {
+      const document = jobToDocument(job);
+      const existing = merged.get(document.file_id);
+      if (existing && isDocumentReady(existing) && !isCompletedStatus(document.status)) {
+        return;
+      }
+      merged.set(document.file_id, { ...existing, ...document });
+    });
+    return Array.from(merged.values());
+  }, [documents, trackedJobs]);
+
   const selectedDocument = useMemo(
-    () => documents.find((document) => document.file_id === fileId),
-    [documents, fileId]
+    () => displayedDocuments.find((document) => document.file_id === fileId),
+    [displayedDocuments, fileId]
   );
+  const selectedDocumentReady = isDocumentReady(selectedDocument);
+  const canAsk = useMemo(
+    () => !asking && selectedDocumentReady && question.trim().length > 0,
+    [asking, question, selectedDocumentReady]
+  );
+  const activeJob = activeJobId ? trackedJobs[activeJobId] || jobState : jobState;
+  const showProcessingToast = Boolean(activeJob) && !isCompletedStatus(activeJob?.status) && !isFailedStatus(activeJob?.status);
+  const processingMessage = formatJobProgress(activeJob);
 
   useEffect(() => {
+    setTrackedJobs(readTrackedJobs());
+    void loadUploadConfig();
     void loadDocuments();
   }, []);
+
+  useEffect(() => {
+    writeTrackedJobs(trackedJobs);
+  }, [trackedJobs]);
+
+  const refreshJob = useCallback(async (jobId: string) => {
+    const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
+    console.log("[ui] polling response received", {
+      jobId,
+      ok: response.ok,
+      status: response.status
+    });
+    const data = (await response.json()) as JobStatus | ErrorPayload;
+    console.log("[ui] polling response body", { jobId, data });
+    if (!response.ok || !("status" in data)) {
+      const errorPayload = data as ErrorPayload;
+      throw new Error(errorPayload.detail || "Job polling failed.");
+    }
+
+    setTrackedJobs((current) => ({
+      ...current,
+      [jobId]: {
+        ...current[jobId],
+        ...data,
+        job_id: data.job_id || jobId
+      }
+    }));
+    setJobState(data);
+
+    if (isCompletedStatus(data.status)) {
+      const indexedFileId = data.file_id || jobId;
+      console.log("[ui] polling completed", { jobId, fileId: indexedFileId });
+      setFileId((currentFileId) => (currentFileId === jobId || !currentFileId ? indexedFileId : currentFileId));
+      setActiveJobId((currentJobId) => (currentJobId === jobId ? null : currentJobId));
+      await loadDocuments(indexedFileId);
+    }
+    if (isFailedStatus(data.status)) {
+      console.error("[ui] polling failed", { jobId, data });
+      setActiveJobId((currentJobId) => (currentJobId === jobId ? null : currentJobId));
+    }
+  }, []);
+
+  useEffect(() => {
+    const pollableJobIds = Object.values(trackedJobs).filter((job) => shouldPollStatus(job.status)).map((job) => job.job_id);
+    if (pollableJobIds.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    async function refreshPollableJobs() {
+      await Promise.allSettled(
+        pollableJobIds.map(async (jobId) => {
+          if (!cancelled) {
+            await refreshJob(jobId);
+          }
+        })
+      );
+    }
+
+    const interval = window.setInterval(refreshPollableJobs, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [refreshJob, trackedJobs]);
+
+  useEffect(() => {
+    function refreshOnReturn() {
+      if (document.visibilityState === "visible") {
+        void loadDocuments(fileId || undefined);
+        Object.values(readTrackedJobs())
+          .filter((job) => shouldPollStatus(job.status))
+          .forEach((job) => {
+            void refreshJob(job.job_id);
+          });
+      }
+    }
+
+    document.addEventListener("visibilitychange", refreshOnReturn);
+    window.addEventListener("focus", refreshOnReturn);
+    return () => {
+      document.removeEventListener("visibilitychange", refreshOnReturn);
+      window.removeEventListener("focus", refreshOnReturn);
+    };
+  }, [fileId, refreshJob]);
 
   async function loadDocuments(preferredFileId?: string) {
     setLoadingDocuments(true);
@@ -124,6 +352,64 @@ export function ChatDemo() {
     }
   }
 
+  async function loadUploadConfig() {
+    const response = await fetch("/api/upload-config", { cache: "no-store" });
+    const data = (await response.json()) as UploadConfig | ErrorPayload;
+    if (!response.ok || !("baseUrl" in data) || !("apiKey" in data)) {
+      const errorPayload = data as ErrorPayload;
+      throw new Error(errorPayload.detail || "Upload backend is not configured.");
+    }
+
+    const nextConfig = {
+      baseUrl: data.baseUrl.replace(/\/$/, ""),
+      apiKey: data.apiKey
+    };
+    setUploadConfig(nextConfig);
+    return nextConfig;
+  }
+
+  async function presignUpload(config: UploadConfig, file: File) {
+    const response = await fetch(`${config.baseUrl}/uploads/presign`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": config.apiKey
+      },
+      body: JSON.stringify({
+        filename: file.name,
+        content_type: file.type || "application/octet-stream",
+        size_bytes: file.size
+      })
+    });
+
+    return readJsonResponse<PresignResponse>(response, "Upload presign failed.");
+  }
+
+  async function uploadToStorage(presign: PresignResponse, file: File) {
+    const response = await fetch(presign.upload_url, {
+      method: "PUT",
+      headers: presign.upload_headers || {},
+      body: file
+    });
+
+    if (!response.ok) {
+      throw new Error(`Storage upload failed with status ${response.status}.`);
+    }
+  }
+
+  async function completeUpload(config: UploadConfig, jobId: string) {
+    const response = await fetch(`${config.baseUrl}/uploads/complete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-API-Key": config.apiKey
+      },
+      body: JSON.stringify({ job_id: jobId })
+    });
+
+    return readJsonResponse<JobResponse>(response, "Upload completion failed.");
+  }
+
   async function onUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -146,73 +432,47 @@ export function ChatDemo() {
     setActiveJobId(null);
     setJobState(null);
 
+    let config: UploadConfig | undefined = uploadConfig || undefined;
+    let uploadStage = "Upload";
     try {
-      const payload = new FormData();
-      payload.append("file", file);
+      config = config || (await loadUploadConfig());
+      uploadStage = "Presign";
+      const presign = await presignUpload(config, file);
+      console.log("[ui] upload presigned", { jobId: presign.job_id });
 
-      const response = await fetch("/api/upload", {
-        method: "POST",
-        body: payload
-      });
-      console.log("[ui] upload response received", {
-        ok: response.ok,
-        status: response.status
-      });
+      uploadStage = "Storage upload";
+      await uploadToStorage(presign, file);
+      console.log("[ui] storage upload completed", { jobId: presign.job_id });
 
-      const data = (await response.json()) as JobResponse | ErrorPayload;
-      console.log("[ui] upload response body", data);
-      if (!response.ok || !("job_id" in data)) {
-        const errorPayload = data as ErrorPayload;
-        throw new Error(errorPayload.detail || "Upload failed.");
-      }
+      uploadStage = "Complete";
+      const data = await completeUpload(config, presign.job_id);
+      console.log("[ui] upload complete response body", data);
 
       const jobId = data.job_id;
+      const uploadedJob: JobStatus = {
+        job_id: jobId,
+        status: data.status || "queued",
+        message: data.message || "Uploaded. Indexing in background.",
+        file_id: data.file_id,
+        filename: data.filename || file.name,
+        processed_chunks: data.processed_chunks,
+        total_chunks: data.total_chunks
+      };
       setActiveJobId(jobId);
+      setJobState(uploadedJob);
+      setTrackedJobs((current) => ({ ...current, [jobId]: uploadedJob }));
+      setFileId(uploadedJob.file_id || jobId);
       console.log("[ui] upload accepted", { jobId });
-      await pollJob(jobId);
+      void refreshJob(jobId).catch((pollError) => {
+        console.error("[ui] initial job refresh failed", pollError);
+      });
     } catch (uploadError) {
       console.error("[ui] upload failed", uploadError);
       setActiveJobId(null);
-      setError(uploadError instanceof Error ? uploadError.message : "Upload failed.");
+      setError(formatUploadError(uploadError, config, uploadStage));
     } finally {
       console.log("[ui] upload finished");
       setUploading(false);
-    }
-  }
-
-  async function pollJob(jobId: string) {
-    console.log("[ui] polling started", { jobId });
-    for (;;) {
-      const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
-      console.log("[ui] polling response received", {
-        jobId,
-        ok: response.ok,
-        status: response.status
-      });
-      const data = (await response.json()) as JobStatus | ErrorPayload;
-      console.log("[ui] polling response body", { jobId, data });
-      if (!response.ok || !("status" in data)) {
-        const errorPayload = data as ErrorPayload;
-        throw new Error(errorPayload.detail || "Job polling failed.");
-      }
-
-      setJobState(data);
-      if (data.status === "completed") {
-        const indexedFileId = data.file_id || jobId;
-        console.log("[ui] polling completed", { jobId, fileId: indexedFileId });
-        setFileId(indexedFileId);
-        setActiveJobId(null);
-        await loadDocuments(indexedFileId);
-        return;
-      }
-      if (data.status === "failed") {
-        console.error("[ui] polling failed", { jobId, data });
-        setActiveJobId(null);
-        throw new Error(data.error || data.message || "Indexing failed.");
-      }
-
-      console.log("[ui] polling retry scheduled", { jobId, nextPollMs: 2000 });
-      await new Promise((resolve) => setTimeout(resolve, 2000));
     }
   }
 
@@ -233,7 +493,11 @@ export function ChatDemo() {
       console.warn("[ui] ask blocked", {
         hasFileId: false
       });
-      setError("Select an indexed document before asking a question.");
+      setError("Select a completed document before asking a question.");
+      return;
+    }
+    if (!selectedDocumentReady) {
+      setError(formatJobProgress(selectedDocument));
       return;
     }
 
@@ -292,8 +556,8 @@ export function ChatDemo() {
         <div style={styles.toast} role="status" aria-live="polite">
           <div style={styles.toastDot} />
           <div>
-            <p style={styles.toastTitle}>Processing document</p>
-            <p style={styles.toastText}>Polling `/jobs/{activeJobId}` until the job is completed.</p>
+            <p style={styles.toastTitle}>Uploaded. Indexing in background.</p>
+            <p style={styles.toastText}>You can leave this page and return while indexing continues.</p>
             <p style={styles.toastMeta}>{processingMessage}</p>
           </div>
         </div>
@@ -313,12 +577,12 @@ export function ChatDemo() {
           <form onSubmit={onUpload} style={styles.stack}>
             <input name="file" type="file" accept=".pdf,.txt" />
             <button disabled={uploading} style={styles.primaryButton} type="submit">
-              {uploading ? "Uploading..." : "Upload and index"}
+              {uploading ? "Uploading..." : "Upload"}
             </button>
           </form>
           <p style={styles.meta}>
             {jobState
-              ? `Status: ${jobState.status} — ${jobState.message}`
+              ? `${jobState.status}: ${formatJobProgress(jobState)}`
               : "Supported file types match the backend: .pdf and .txt"}
           </p>
           <label style={styles.selectLabel} htmlFor="document-select">
@@ -334,15 +598,15 @@ export function ChatDemo() {
             style={styles.select}
           >
             <option value="">{loadingDocuments ? "Loading documents..." : "Select a document"}</option>
-            {documents.map((document) => (
+            {displayedDocuments.map((document) => (
               <option key={document.file_id} value={document.file_id}>
-                {document.filename || document.file_id}
+                {document.filename || document.file_id} {isDocumentReady(document) ? "" : `(${document.status || "queued"})`}
               </option>
             ))}
           </select>
           {fileId ? (
-            <p style={styles.success}>
-              Selected document: {selectedDocument?.filename || fileId}
+            <p style={selectedDocumentReady ? styles.success : isFailedStatus(selectedDocument?.status) ? styles.errorInline : styles.warning}>
+              {selectedDocument?.filename || fileId}: {formatJobProgress(selectedDocument)}
             </p>
           ) : null}
         </div>
@@ -371,9 +635,10 @@ export function ChatDemo() {
             <textarea
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
-              placeholder="Ask about the uploaded document..."
+              placeholder={selectedDocumentReady ? "Ask about the uploaded document..." : "Chat unlocks when indexing completes."}
               rows={4}
               style={styles.textarea}
+              disabled={!selectedDocumentReady}
             />
             <button disabled={!canAsk} style={styles.secondaryButton} type="submit">
               {asking ? "Thinking..." : "Send"}
@@ -543,6 +808,14 @@ const styles: Record<string, CSSProperties> = {
   success: {
     margin: "12px 0 0",
     color: "var(--success)"
+  },
+  warning: {
+    margin: "12px 0 0",
+    color: "var(--warning)"
+  },
+  errorInline: {
+    margin: "12px 0 0",
+    color: "#9f2d2d"
   },
   messages: {
     display: "flex",
