@@ -38,11 +38,6 @@ type ErrorPayload = {
   detail?: string;
 };
 
-type UploadConfig = {
-  baseUrl: string;
-  apiKey: string;
-};
-
 type DocumentItem = {
   file_id: string;
   job_id?: string;
@@ -102,10 +97,10 @@ function formatJobProgress(item?: Pick<DocumentItem, "processed_chunks" | "total
   return item.message || "Uploaded. Indexing in background.";
 }
 
-function formatUploadError(error: unknown, config?: UploadConfig, stage?: string) {
+function formatUploadError(error: unknown, stage?: string) {
   const stageLabel = stage ? `${stage} failed. ` : "";
-  if (error instanceof TypeError && error.message === "Failed to fetch" && config) {
-    return `${stageLabel}Could not complete the direct upload from the browser. Check that the backend and S3 upload URL are reachable from this browser, and CORS allows this origin plus required headers. Backend: ${config.baseUrl}.`;
+  if (error instanceof TypeError && error.message === "Failed to fetch") {
+    return `${stageLabel}Could not complete the direct upload from the browser. If this happened during storage upload, check that the S3 upload URL is reachable and S3 CORS allows this origin plus the returned upload headers.`;
   }
 
   return error instanceof Error ? `${stageLabel}${error.message}` : `${stageLabel}Upload failed.`;
@@ -197,7 +192,6 @@ export function ChatDemo() {
   const [loadingDocuments, setLoadingDocuments] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
-  const [uploadConfig, setUploadConfig] = useState<UploadConfig | null>(null);
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -233,7 +227,6 @@ export function ChatDemo() {
 
   useEffect(() => {
     setTrackedJobs(readTrackedJobs());
-    void loadUploadConfig();
     void loadDocuments();
   }, []);
 
@@ -352,28 +345,11 @@ export function ChatDemo() {
     }
   }
 
-  async function loadUploadConfig() {
-    const response = await fetch("/api/upload-config", { cache: "no-store" });
-    const data = (await response.json()) as UploadConfig | ErrorPayload;
-    if (!response.ok || !("baseUrl" in data) || !("apiKey" in data)) {
-      const errorPayload = data as ErrorPayload;
-      throw new Error(errorPayload.detail || "Upload backend is not configured.");
-    }
-
-    const nextConfig = {
-      baseUrl: data.baseUrl.replace(/\/$/, ""),
-      apiKey: data.apiKey
-    };
-    setUploadConfig(nextConfig);
-    return nextConfig;
-  }
-
-  async function presignUpload(config: UploadConfig, file: File) {
-    const response = await fetch(`${config.baseUrl}/uploads/presign`, {
+  async function presignUpload(file: File) {
+    const response = await fetch("/api/uploads/presign", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "X-API-Key": config.apiKey
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         filename: file.name,
@@ -397,12 +373,11 @@ export function ChatDemo() {
     }
   }
 
-  async function completeUpload(config: UploadConfig, jobId: string) {
-    const response = await fetch(`${config.baseUrl}/uploads/complete`, {
+  async function completeUpload(jobId: string) {
+    const response = await fetch("/api/uploads/complete", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "X-API-Key": config.apiKey
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({ job_id: jobId })
     });
@@ -432,12 +407,10 @@ export function ChatDemo() {
     setActiveJobId(null);
     setJobState(null);
 
-    let config: UploadConfig | undefined = uploadConfig || undefined;
     let uploadStage = "Upload";
     try {
-      config = config || (await loadUploadConfig());
       uploadStage = "Presign";
-      const presign = await presignUpload(config, file);
+      const presign = await presignUpload(file);
       console.log("[ui] upload presigned", { jobId: presign.job_id });
 
       uploadStage = "Storage upload";
@@ -445,7 +418,7 @@ export function ChatDemo() {
       console.log("[ui] storage upload completed", { jobId: presign.job_id });
 
       uploadStage = "Complete";
-      const data = await completeUpload(config, presign.job_id);
+      const data = await completeUpload(presign.job_id);
       console.log("[ui] upload complete response body", data);
 
       const jobId = data.job_id;
@@ -469,7 +442,7 @@ export function ChatDemo() {
     } catch (uploadError) {
       console.error("[ui] upload failed", uploadError);
       setActiveJobId(null);
-      setError(formatUploadError(uploadError, config, uploadStage));
+      setError(formatUploadError(uploadError, uploadStage));
     } finally {
       console.log("[ui] upload finished");
       setUploading(false);
