@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -166,6 +166,11 @@ function jobToDocument(job: JobStatus): DocumentItem {
   };
 }
 
+function upsertDocument(documents: DocumentItem[], nextDocument: DocumentItem) {
+  const nextDocuments = documents.filter((document) => document.file_id !== nextDocument.file_id);
+  return [nextDocument, ...nextDocuments];
+}
+
 function readTrackedJobs() {
   if (typeof window === "undefined") {
     return {};
@@ -190,11 +195,13 @@ export function ChatDemo() {
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [trackedJobs, setTrackedJobs] = useState<Record<string, JobStatus>>({});
   const [loadingDocuments, setLoadingDocuments] = useState(false);
+  const [hasLoadedDocuments, setHasLoadedDocuments] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [jobState, setJobState] = useState<JobStatus | null>(null);
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadingDocumentsRef = useRef(false);
 
   const displayedDocuments = useMemo(() => {
     const merged = new Map<string, DocumentItem>();
@@ -225,9 +232,15 @@ export function ChatDemo() {
   const showProcessingToast = Boolean(activeJob) && !isCompletedStatus(activeJob?.status) && !isFailedStatus(activeJob?.status);
   const processingMessage = formatJobProgress(activeJob);
 
+  function loadDocumentsOnBrowse() {
+    if (!hasLoadedDocuments && !loadingDocumentsRef.current) {
+      loadingDocumentsRef.current = true;
+      void loadDocuments(fileId || undefined);
+    }
+  }
+
   useEffect(() => {
     setTrackedJobs(readTrackedJobs());
-    void loadDocuments();
   }, []);
 
   useEffect(() => {
@@ -260,10 +273,11 @@ export function ChatDemo() {
 
     if (isCompletedStatus(data.status)) {
       const indexedFileId = data.file_id || jobId;
+      const completedDocument = jobToDocument({ ...data, job_id: data.job_id || jobId, file_id: indexedFileId });
       console.log("[ui] polling completed", { jobId, fileId: indexedFileId });
+      setDocuments((currentDocuments) => upsertDocument(currentDocuments, completedDocument));
       setFileId((currentFileId) => (currentFileId === jobId || !currentFileId ? indexedFileId : currentFileId));
       setActiveJobId((currentJobId) => (currentJobId === jobId ? null : currentJobId));
-      await loadDocuments(indexedFileId);
     }
     if (isFailedStatus(data.status)) {
       console.error("[ui] polling failed", { jobId, data });
@@ -298,7 +312,6 @@ export function ChatDemo() {
   useEffect(() => {
     function refreshOnReturn() {
       if (document.visibilityState === "visible") {
-        void loadDocuments(fileId || undefined);
         Object.values(readTrackedJobs())
           .filter((job) => shouldPollStatus(job.status))
           .forEach((job) => {
@@ -313,9 +326,10 @@ export function ChatDemo() {
       document.removeEventListener("visibilitychange", refreshOnReturn);
       window.removeEventListener("focus", refreshOnReturn);
     };
-  }, [fileId, refreshJob]);
+  }, [refreshJob]);
 
   async function loadDocuments(preferredFileId?: string) {
+    loadingDocumentsRef.current = true;
     setLoadingDocuments(true);
     try {
       const response = await fetch("/api/documents", { cache: "no-store" });
@@ -327,6 +341,7 @@ export function ChatDemo() {
 
       const nextDocuments = normalizeDocuments(data);
       setDocuments(nextDocuments);
+      setHasLoadedDocuments(true);
       const nextFileId =
         preferredFileId && nextDocuments.some((document) => document.file_id === preferredFileId)
           ? preferredFileId
@@ -341,6 +356,7 @@ export function ChatDemo() {
     } catch (documentsError) {
       console.error("[ui] documents failed", documentsError);
     } finally {
+      loadingDocumentsRef.current = false;
       setLoadingDocuments(false);
     }
   }
@@ -564,6 +580,8 @@ export function ChatDemo() {
           <select
             id="document-select"
             value={fileId || ""}
+            onClick={loadDocumentsOnBrowse}
+            onFocus={loadDocumentsOnBrowse}
             onChange={(event) => {
               setFileId(event.target.value || null);
               setMessages([]);
